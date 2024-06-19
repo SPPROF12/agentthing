@@ -1,0 +1,232 @@
+Solidity Contract: Agent.sol
+This Solidity contract is designed to interact with an oracle to run agents that perform iterations of querying and responding using a large language model (LLM). Below is an annotated explanation of the code:
+
+solidity
+Copy code
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.9;
+
+import "./interfaces/IOracle.sol";
+
+// @title Agent
+// @notice This contract interacts with teeML oracle to run agents that perform multiple iterations of querying and responding using a large language model (LLM).
+contract Agent {
+
+    string public prompt;
+
+    struct Message {
+        string role;
+        string content;
+    }
+
+    struct AgentRun {
+        address owner;
+        Message[] messages;
+        uint responsesCount;
+        uint8 max_iterations;
+        bool is_finished;
+    }
+
+    // Mapping from run ID to AgentRun
+    mapping(uint => AgentRun) public agentRuns;
+    uint private agentRunCount;
+
+    // Event emitted when a new agent run is created
+    event AgentRunCreated(address indexed owner, uint indexed runId);
+
+    // Address of the contract owner
+    address private owner;
+
+    // Address of the oracle contract
+    address public oracleAddress;
+
+    // Event emitted when the oracle address is updated
+    event OracleAddressUpdated(address indexed newOracleAddress);
+
+    // Configuration for the OpenAI request
+    IOracle.OpenAiRequest private config;
+
+    // Constructor to initialize the contract with oracle address and system prompt
+    constructor(address initialOracleAddress, string memory systemPrompt) {
+        owner = msg.sender;
+        oracleAddress = initialOracleAddress;
+        prompt = systemPrompt;
+
+        config = IOracle.OpenAiRequest({
+            model : "gpt-4-turbo-preview",
+            frequencyPenalty : 21, // > 20 for null
+            logitBias : "", // empty str for null
+            maxTokens : 1000, // 0 for null
+            presencePenalty : 21, // > 20 for null
+            responseFormat : "{\"type\":\"text\"}",
+            seed : 0, // null
+            stop : "", // null
+            temperature : 10, // Example temperature (scaled up, 10 means 1.0), > 20 means null
+            topP : 101, // Percentage 0-100, > 100 means null
+            tools : "[{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Search the internet\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search query\"}},\"required\":[\"query\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"image_generation\",\"description\":\"Generates an image using Dalle-2\",\"parameters\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"Dalle-2 prompt to generate an image\"}},\"required\":[\"prompt\"]}}}]",
+            toolChoice : "auto", // "none" or "auto"
+            user : "" // null
+        });
+    }
+
+    // Modifier to ensure the caller is the contract owner
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Caller is not owner");
+        _;
+    }
+
+    // Modifier to ensure the caller is the oracle contract
+    modifier onlyOracle() {
+        require(msg.sender == oracleAddress, "Caller is not oracle");
+        _;
+    }
+
+    // Updates the oracle address
+    function setOracleAddress(address newOracleAddress) public onlyOwner {
+        oracleAddress = newOracleAddress;
+        emit OracleAddressUpdated(newOracleAddress);
+    }
+
+    // Starts a new agent run
+    function runAgent(string memory query, uint8 max_iterations) public returns (uint) {
+        AgentRun storage run = agentRuns[agentRunCount];
+
+        run.owner = msg.sender;
+        run.is_finished = false;
+        run.responsesCount = 0;
+        run.max_iterations = max_iterations;
+
+        Message memory systemMessage;
+        systemMessage.content = prompt;
+        systemMessage.role = "system";
+        run.messages.push(systemMessage);
+
+        Message memory newMessage;
+        newMessage.content = query;
+        newMessage.role = "user";
+        run.messages.push(newMessage);
+
+        uint currentId = agentRunCount;
+        agentRunCount = agentRunCount + 1;
+
+        IOracle(oracleAddress).createOpenAiLlmCall(currentId, config);
+        emit AgentRunCreated(run.owner, currentId);
+
+        return currentId;
+    }
+
+    // Handles the response from the oracle for an OpenAI LLM call
+    function onOracleOpenAiLlmResponse(uint runId, IOracle.OpenAiResponse memory response, string memory errorMessage) public onlyOracle {
+        AgentRun storage run = agentRuns[runId];
+
+        if (!compareStrings(errorMessage, "")) {
+            Message memory newMessage;
+            newMessage.role = "assistant";
+            newMessage.content = errorMessage;
+            run.messages.push(newMessage);
+            run.responsesCount++;
+            run.is_finished = true;
+            return;
+        }
+        if (run.responsesCount >= run.max_iterations) {
+            run.is_finished = true;
+            return;
+        }
+        if (!compareStrings(response.content, "")) {
+            Message memory assistantMessage;
+            assistantMessage.content = response.content;
+            assistantMessage.role = "assistant";
+            run.messages.push(assistantMessage);
+            run.responsesCount++;
+        }
+        if (!compareStrings(response.functionName, "")) {
+            IOracle(oracleAddress).createFunctionCall(runId, response.functionName, response.functionArguments);
+            return;
+        }
+        run.is_finished = true;
+    }
+
+    // Handles the response from the oracle for a function call
+    function onOracleFunctionResponse(uint runId, string memory response, string memory errorMessage) public onlyOracle {
+        AgentRun storage run = agentRuns[runId];
+        require(!run.is_finished, "Run is finished");
+
+        string memory result = response;
+        if (!compareStrings(errorMessage, "")) {
+            result = errorMessage;
+        }
+
+        Message memory newMessage;
+        newMessage.role = "user";
+        newMessage.content = result;
+        run.messages.push(newMessage);
+        run.responsesCount++;
+        IOracle(oracleAddress).createOpenAiLlmCall(runId, config);
+    }
+
+    // Retrieves the message history contents for a given agent run
+    function getMessageHistoryContents(uint agentId) public view returns (string[] memory) {
+        string[] memory messages = new string[](agentRuns[agentId].messages.length);
+        for (uint i = 0; i < agentRuns[agentId].messages.length; i++) {
+            messages[i] = agentRuns[agentId].messages[i].content;
+        }
+        return messages;
+    }
+
+    // Retrieves the roles of the messages in a given agent run
+    function getMessageHistoryRoles(uint agentId) public view returns (string[] memory) {
+        string[] memory roles = new string[](agentRuns[agentId].messages.length);
+        for (uint i = 0; i < agentRuns[agentId].messages.length; i++) {
+            roles[i] = agentRuns[agentId].messages[i].role;
+        }
+        return roles;
+    }
+
+    // Checks if a given agent run is finished
+    function isRunFinished(uint runId) public view returns (bool) {
+        return agentRuns[runId].is_finished;
+    }
+
+    // Compares two strings for equality
+    function compareStrings(string memory a, string memory b) private pure returns (bool) {
+        return (keccak256(abi.encodePacked((a))) == keccak256(abi.encodePacked((b))));
+    }
+}
+JSON Metadata
+The JSON provided describes the input for a Solidity compiler, which includes the contract's code, its dependencies, settings, and metadata. Here's a structured explanation of the JSON:
+
+json
+Copy code
+{
+    "compilerInput": "{...}", // Encoded string containing the compiler input configuration
+    "name": "Agent", // Name of the contract
+    "metadata": "{...}" // Encoded string containing metadata and ABI (Application Binary Interface)
+}
+compilerInput: This string includes information about the source files, settings for the compiler, and the optimizer.
+
+name: The name of the contract is "Agent".
+
+metadata: This string includes:
+
+The compiler version used.
+The language (Solidity).
+The ABI, which describes the interface of the contract (functions, events).
+Settings and compilation targets.
+Source code information.
+ABI Explanation
+The ABI (Application Binary Interface) in the metadata part of the JSON defines how to interact with the contract from outside the blockchain (e.g., through a web interface or another smart contract). Here’s a brief on the key parts of the ABI:
+
+Constructor: Initializes the contract with the oracle address and a system prompt.
+Events: AgentRunCreated and OracleAddressUpdated for logging specific actions.
+Functions:
+setOracleAddress(address): Updates the oracle address.
+runAgent(string, uint8): Starts a new agent run.
+onOracleOpenAiLlmResponse(uint, IOracle.OpenAiResponse, string): Handles responses from the oracle.
+onOracleFunctionResponse(uint, string, string): Handles function call responses.
+View functions like getMessageHistoryContents(uint), getMessageHistoryRoles(uint), and isRunFinished(uint) to retrieve data.
+Key Concepts
+Agent Runs: Each run is a process where the agent iteratively queries and responds using the LLM.
+Messages: Contains the dialogue history between the user and the agent.
+Oracle Interaction: The contract interacts with an oracle to perform LLM calls and function executions.
+Modifiers: Used to restrict access to certain functions (onlyOwner and onlyOracle).
+By understanding these components and their interactions, the purpose and functionality of the contract become clear. This contract is designed to facilitate and manage iterative agent interactions with an oracle that uses a large language model for processing queries and generating responses.
